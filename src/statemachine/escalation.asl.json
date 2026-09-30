@@ -1,0 +1,170 @@
+{
+  "Comment": "ShopTriage escalation: notify primary role, wait for ack, re-alert + escalate to owner on timeout, mark overdue on second timeout.",
+  "StartAt": "NotifyPrimaryRole",
+  "States": {
+    "NotifyPrimaryRole": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${InboxWriterArn}",
+        "Payload": {
+          "call_id.$": "$.call_id",
+          "role.$": "$.primary_role",
+          "category.$": "$.category",
+          "urgency.$": "$.urgency",
+          "summary.$": "$.summary",
+          "caller_name.$": "$.caller_name",
+          "callback_number.$": "$.callback_number",
+          "alert_stage": "primary"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultPath": null,
+      "Next": "SendPrimaryAlert"
+    },
+    "SendPrimaryAlert": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${SendAlertArn}",
+        "Payload": {
+          "call_id.$": "$.call_id",
+          "role.$": "$.primary_role",
+          "category.$": "$.category",
+          "urgency.$": "$.urgency",
+          "summary.$": "$.summary",
+          "caller_name.$": "$.caller_name",
+          "callback_number.$": "$.callback_number",
+          "alert_stage": "primary",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSecondsPath": "$.ack_window_seconds",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": null,
+          "Next": "NotifyEscalationRole"
+        }
+      ],
+      "ResultPath": null,
+      "Next": "Acknowledged"
+    },
+    "NotifyEscalationRole": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${InboxWriterArn}",
+        "Payload": {
+          "call_id.$": "$.call_id",
+          "role.$": "$.escalation_role",
+          "category.$": "$.category",
+          "urgency.$": "$.urgency",
+          "summary.$": "$.summary",
+          "caller_name.$": "$.caller_name",
+          "callback_number.$": "$.callback_number",
+          "alert_stage": "escalation"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultPath": null,
+      "Next": "SendEscalationAlert"
+    },
+    "SendEscalationAlert": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${SendAlertArn}",
+        "Payload": {
+          "call_id.$": "$.call_id",
+          "role.$": "$.escalation_role",
+          "category.$": "$.category",
+          "urgency.$": "$.urgency",
+          "summary.$": "$.summary",
+          "caller_name.$": "$.caller_name",
+          "callback_number.$": "$.callback_number",
+          "alert_stage": "escalation",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSecondsPath": "$.ack_window_seconds",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": null,
+          "Next": "SetOverdue"
+        }
+      ],
+      "ResultPath": null,
+      "Next": "Acknowledged"
+    },
+    "SetOverdue": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoTableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('CALL#{}', $.call_id)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #st = :s, updated_at = :u",
+        "ExpressionAttributeNames": {"#st": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "overdue"},
+          ":u": {"S.$": "$$.State.EnteredTime"}
+        }
+      },
+      "ResultPath": null,
+      "Next": "LogOverdueTimeline"
+    },
+    "LogOverdueTimeline": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${DynamoTableName}",
+        "Item": {
+          "PK": {"S.$": "States.Format('CALL#{}', $.call_id)"},
+          "SK": {"S.$": "States.Format('EVENT#{}#overdue', $$.State.EnteredTime)"},
+          "call_id": {"S.$": "$.call_id"},
+          "stage": {"S": "overdue"},
+          "ts": {"S.$": "$$.State.EnteredTime"}
+        }
+      },
+      "ResultPath": null,
+      "End": true
+    },
+    "Acknowledged": {
+      "Type": "Succeed"
+    }
+  }
+}

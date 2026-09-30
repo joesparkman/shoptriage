@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ShopTriage — Coming Soon</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Inter:wght@400;500&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'Inter', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      padding: 2rem;
+    }
+
+    .badge {
+      display: inline-block;
+      background: #1f2d3d;
+      border: 1px solid #2d4a6e;
+      color: #58a6ff;
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 0.35rem 0.8rem;
+      border-radius: 999px;
+    }
+
+    h1 {
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: clamp(2rem, 6vw, 3.5rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    h1 span { color: #58a6ff; }
+
+    p {
+      color: #8b949e;
+      font-size: 1.05rem;
+      max-width: 480px;
+      text-align: center;
+      line-height: 1.65;
+    }
+
+    .stack {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      justify-content: center;
+      margin-top: 0.5rem;
+    }
+
+    .tag {
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      font-size: 0.7rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 6px;
+      font-family: 'Space Grotesk', sans-serif;
+      letter-spacing: 0.04em;
+    }
+
+    footer {
+      position: fixed;
+      bottom: 1.5rem;
+      color: #484f58;
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <span class="badge">AWS Zero to Shipped Hackathon 2026</span>
+
+  <h1>Shop<span>Triage</span></h1>
+
+  <p>
+    AI-powered call triage and routing for independent auto repair shops.
+    Every voicemail classified, every urgent call escalated, so nothing falls through the cracks.
+  </p>
+
+  <div class="stack">
+    <span class="tag">Amazon Transcribe</span>
+    <span class="tag">Claude Sonnet</span>
+    <span class="tag">EventBridge</span>
+    <span class="tag">Step Functions</span>
+    <span class="tag">DynamoDB</span>
+    <span class="tag">API Gateway</span>
+  </div>
+
+  <footer>Deployment in progress — Day 1 of 8</footer>
+</body>
+</html>

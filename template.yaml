@@ -1,0 +1,1540 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ShopTriage — AI call-triage and routing for independent auto repair shops.
+  AWS Zero to Shipped Hackathon 2026. Deployed via shoptriage-agent IAM profile.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Global defaults applied to every AWS::Serverless::Function in this template.
+# ──────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: shoptriage
+        LOG_LEVEL: INFO
+    Tags:
+      project: shoptriage
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+    Description: Deployment environment (used in resource names)
+
+  # Sender and recipient for alert emails. Deliberately has NO default: changing it
+  # replaces the SES identity (and needs re-verification), so a deploy without an
+  # explicit value must fail loudly instead of quietly using a placeholder.
+  # Set it in your local samconfig.toml (see samconfig.toml.example).
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be a valid email address
+    Description: Verified SES address used as the alert sender and, in this demo, every alert recipient
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # FRONTEND (Day 1)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      DeployedBy: shoptriage-agent
+    Properties:
+      BucketName: !Sub "shoptriage-frontend-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: shoptriage-frontend-oac
+        Description: OAC for ShopTriage frontend bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub
+                  - "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistId}"
+                  - DistId: !Ref FrontendDistribution
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: project
+          Value: shoptriage
+      DistributionConfig:
+        Enabled: true
+        Comment: ShopTriage frontend
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        Origins:
+          - Id: S3FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: S3FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INTAKE BUCKETS (Day 2)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Incoming voicemails — ObjectCreated events trigger start_transcription.
+  # Lifecycle rule expires objects after 30 days to contain storage cost.
+  # NOTE: The S3 → Lambda notification is configured on the Lambda side
+  # (StartTranscriptionFunction Events:) to avoid a circular dependency.
+  # CloudFormation cannot resolve VoicemailsBucket ↔ StartTranscriptionFunction
+  # if both reference each other, so SAM's event binding breaks the cycle.
+  VoicemailsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "shoptriage-voicemails-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Pre-generated sample voicemails are managed outside CloudFormation.
+  # The bucket shoptriage-samples-<account> was created by scripts/make_samples.py
+  # and is referenced by name (via !Sub) in DemoTriggerFunction env vars.
+  # Keeping it outside the stack avoids a ResourceExistenceCheck failure.
+
+  # Transcribe writes its output JSON here. A dedicated bucket keeps the
+  # voicemails bucket clean and lets us scope the process_transcript IAM
+  # policy to just this bucket rather than the entire voicemails bucket.
+  TranscribeOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "shoptriage-transcribe-output-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Allow Amazon Transcribe service to write output to this bucket.
+  TranscribeOutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TranscribeOutputBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowTranscribeWrite
+            Effect: Allow
+            Principal:
+              Service: transcribe.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub "${TranscribeOutputBucket.Arn}/*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DYNAMODB TABLE (Day 2)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Single-table design — one table, three entity types:
+  #   CALL#<id> / META        → call record
+  #   CALL#<id> / EVENT#<ts>  → timeline entries
+  #   INBOX#<role> / <ts>#<id> → staff inbox rows
+  #
+  # GSI1 flips status → PK and received_at → SK so the callback board can
+  # query by status without a full scan. PAY_PER_REQUEST avoids provisioning
+  # math for a hackathon with unpredictable demo traffic.
+  ShopTriageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: shoptriage
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false   # not needed for demo data
+      SSESpecification:
+        SSEEnabled: true                    # encryption at rest, no extra cost
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: received_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: received_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # EVENTBRIDGE CUSTOM BUS + ARCHIVE (Day 3)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Custom bus isolates ShopTriage routing events from the default AWS bus.
+  # process_transcript publishes here; rules on this bus fan out to SNS/SQS.
+  # Using a custom bus means we can apply resource-based policies and archive
+  # independently of any other event traffic in the account.
+  ShopTriageBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: shop-triage-bus
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Archive every event on the bus for 7 days.
+  # Purpose: replay events during development and demo without re-triggering
+  # the intake pipeline. EventBridge replay re-delivers archived events to the
+  # bus exactly as they were, so all routing rules fire again from the same payload.
+  # 7-day retention matches the DynamoDB TTL on call records.
+  ShopTriageBusArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: shop-triage-bus-archive
+      Description: Archive of all events on the shop-triage-bus for replay
+      SourceArn: !GetAtt ShopTriageBus.Arn
+      EventPattern:
+        source:
+          - autoshop.triage
+      RetentionDays: 7
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SNS TOPICS (Day 3)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Receives urgency=emergency events (e.g. tow/breakdown).
+  # Day 4 adds SES email subscriptions; the topic exists now so routing rules
+  # can reference its ARN without a forward-reference problem.
+  OncallAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: shoptriage-oncall-alerts
+      DisplayName: ShopTriage On-Call Alerts
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Receives is_comeback=true (non-emergency) events.
+  # The shop owner gets these — comeback customers are high-value and at risk
+  # of churning if ignored, so they warrant a direct owner notification.
+  OwnerAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: shoptriage-owner-alerts
+      DisplayName: ShopTriage Owner Alerts
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SQS QUEUES + DLQs (Day 3)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Dead-letter queue for front-office messages.
+  # If a consumer fails to process a message 3 times (maxReceiveCount=3),
+  # SQS moves it here automatically. (No consumer is configured today, so
+  # this only fills if one is added later.) A CloudWatch alarm fires immediately so
+  # the team knows something is broken before it silently accumulates failures.
+  FrontOfficeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: shoptriage-front-office-dlq
+      MessageRetentionPeriod: 1209600   # 14 days — keep for investigation
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Receives repair_status, scheduling, billing, estimate calls.
+  # No Lambda is subscribed to this queue (no event source mapping); messages
+  # wait here until retention expires. inbox_writer is not a consumer: Step
+  # Functions invokes it directly, once per escalation alert.
+  # VisibilityTimeout=300s gives the Lambda 5 minutes to process before the
+  # message becomes visible again — generous enough for any DynamoDB write.
+  FrontOfficeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: shoptriage-front-office-queue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FrontOfficeDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Dead-letter queue for vendor messages.
+  VendorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: shoptriage-vendor-dlq
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Receives parts_vendor calls.
+  # No Lambda trigger in scope; the shop checks this queue manually (Day 5 UI).
+  VendorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: shoptriage-vendor-queue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt VendorDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # EventBridge needs permission to write to SQS queues.
+  # Without this policy, EventBridge silently drops messages and the rule
+  # shows no errors — only a missing-message symptom.
+  FrontOfficeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FrontOfficeQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FrontOfficeQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/*"
+
+  VendorQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref VendorQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt VendorQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # EVENTBRIDGE ROUTING RULES ON CUSTOM BUS (Day 3)
+  # ════════════════════════════════════════════════════════════════════════════
+  # All rules match source=autoshop.triage, detail-type=CallTriaged.
+  # The detail field matches the JSON that process_transcript publishes.
+  # Rule priority is implicit — EventBridge evaluates all rules independently;
+  # if a call is both emergency AND comeback, both rules fire. The Build Plan
+  # says comeback rule fires on urgency != emergency, so we guard that with
+  # anything-but: [emergency] to avoid double-alerting.
+
+  # Rule 1: urgency=emergency → SNS oncall-alerts + SNS owner-alerts
+  # Why both? An emergency is an owned problem too; the owner needs to know.
+  RouteEmergencyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-emergency
+      Description: urgency=emergency → oncall-alerts SNS topic
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          urgency:
+            - emergency
+      State: ENABLED
+      Targets:
+        - Id: OncallSNSTarget
+          Arn: !Ref OncallAlertsTopic
+        - Id: OwnerSNSEmergencyTarget
+          Arn: !Ref OwnerAlertsTopic
+
+  # Rule 2: is_comeback=true AND urgency != emergency → SNS owner-alerts
+  # Comeback customers (called before, same issue) are the highest-churn risk.
+  # We use "anything-but" so this rule doesn't double-fire with the emergency rule.
+  RouteComebackRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-comeback
+      Description: is_comeback=true (non-emergency) → owner-alerts SNS topic
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          is_comeback:
+            - true
+          urgency:
+            - anything-but: emergency
+      State: ENABLED
+      Targets:
+        - Id: OwnerSNSComebackTarget
+          Arn: !Ref OwnerAlertsTopic
+
+  # Rule 3: front-office categories → SQS front-office-queue
+  # repair_status, scheduling, billing, estimate are handled during office hours.
+  # SQS gives these messages durability — no events lost even with no consumer running.
+  RouteFrontOfficeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-front-office
+      Description: Front-office categories → front-office-queue
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          category:
+            - repair_status
+            - scheduling
+            - billing
+            - estimate
+      State: ENABLED
+      Targets:
+        - Id: FrontOfficeQueueTarget
+          Arn: !GetAtt FrontOfficeQueue.Arn
+
+  # Rule 4: parts_vendor → SQS vendor-queue
+  # Vendor callbacks are low-urgency but must not be lost. SQS + DLQ ensures
+  # the message survives even if no consumer is running immediately.
+  RouteVendorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-vendor
+      Description: parts_vendor → vendor-queue
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          category:
+            - parts_vendor
+      State: ENABLED
+      Targets:
+        - Id: VendorQueueTarget
+          Arn: !GetAtt VendorQueue.Arn
+
+  # Rule (application): every CallTriaged → routing_dispatcher Lambda
+  # This rule fires in parallel with all the fan-out rules above.
+  # routing_dispatcher updates DynamoDB status=routed and writes the
+  # STAGE_ROUTED timeline event — neither SNS nor SQS can do that.
+  RouteDispatcherRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-dispatcher
+      Description: Every CallTriaged event → routing_dispatcher Lambda (DynamoDB + timeline)
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+      State: ENABLED
+      Targets:
+        - Id: RoutingDispatcherTarget
+          Arn: !GetAtt RoutingDispatcherFunction.Arn
+
+  # Rule 5: spam_other → log only (CloudWatch Logs)
+  # We still need a record of spam for metrics and to detect if Claude
+  # is miscategorizing real calls. A dedicated log group keeps it separate
+  # from Lambda logs and is queryable via CloudWatch Logs Insights.
+  SpamLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /shoptriage/spam-events
+      RetentionInDays: 7
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # Rule: status=needs_review → SNS owner-alerts
+  # A voicemail Claude couldn't classify (JSON parse error, API failure, missing fields)
+  # still needs to reach a person. We route to owner-alerts so it won't be silently lost.
+  # The owner can review the raw transcript in DynamoDB and decide what to do.
+  RouteNeedsReviewRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-needs-review
+      Description: status=needs_review → owner-alerts SNS topic (unclassified calls must reach a person)
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          status:
+            - needs_review
+      State: ENABLED
+      Targets:
+        - Id: OwnerSNSNeedsReviewTarget
+          Arn: !Ref OwnerAlertsTopic
+
+  RouteSpamRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-route-spam
+      Description: spam_other → CloudWatch Logs (logged only, no alert)
+      EventBusName: !Ref ShopTriageBus
+      EventPattern:
+        source:
+          - autoshop.triage
+        detail-type:
+          - CallTriaged
+        detail:
+          category:
+            - spam_other
+      State: ENABLED
+      Targets:
+        - Id: SpamLogTarget
+          Arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/shoptriage/spam-events"
+
+  # EventBridge needs permission to write to CloudWatch Logs.
+  SpamLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: shoptriage-eventbridge-spam-log-policy
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "AllowEventBridgeLogs",
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/shoptriage/spam-events:*",
+            "Condition": {
+              "ArnEquals": {
+                "aws:SourceArn": "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/shoptriage-route-spam"
+              }
+            }
+          }]
+        }
+
+  # SNS topics also need a resource policy allowing EventBridge to publish.
+  # Without this, EventBridge silently drops messages to SNS from a custom bus.
+  OncallAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OncallAlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OncallAlertsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/*"
+
+  OwnerAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OwnerAlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OwnerAlertsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CLOUDWATCH ALARMS — DLQ depth (Day 3)
+  # ════════════════════════════════════════════════════════════════════════════
+  # A DLQ with messages means a consumer is failing. (No consumer is configured
+  # today, so this only fires if one is added later.)
+  # Alarm fires when ApproximateNumberOfMessagesVisible > 0.
+  # Using >= 1 threshold so the very first dead-letter wakes someone up.
+  # Period=60s, EvaluationPeriods=1: alert within 1 minute of a failure.
+  # No SNS action yet (Day 4 wires the notification channel).
+
+  FrontOfficeDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shoptriage-front-office-dlq-depth
+      AlarmDescription: Messages in front-office DLQ — a queue consumer may be failing
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FrontOfficeDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  VendorDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shoptriage-vendor-dlq-depth
+      AlarmDescription: Messages in vendor DLQ — vendor queue consumer may be broken
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt VendorDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # LAMBDA LAYER (Day 2)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Shared code used by every Lambda: Claude client, DynamoDB helpers,
+  # timeline logger. Packaging as a Layer means changes to shared code
+  # redeploy once instead of in every function zip.
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: shoptriage-shared
+      Description: Shared utilities — Claude client, DynamoDB helpers, timeline logger
+      ContentUri: src/layers/shared/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SSM PARAMETER (Day 1, kept)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  AnthropicApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /shoptriage/anthropic-api-key
+      Type: String
+      Value: PLACEHOLDER_REPLACE_AFTER_DEPLOY
+      Description: Anthropic API key for ShopTriage Claude integration
+      Tags:
+        project: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SES EMAIL IDENTITY (Day 4)
+  # ════════════════════════════════════════════════════════════════════════════
+  # SES starts every new account in sandbox mode: both the sender AND every
+  # recipient must be verified identities. Creating this resource triggers
+  # AWS to send a verification email to the address below — click the link
+  # in that email once, no console steps needed beyond that.
+  AlertEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref AlertEmail
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # LAMBDA FUNCTIONS (Day 2 — real implementations)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  StartTranscriptionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-start-transcription
+      CodeUri: src/lambdas/start_transcription/
+      Handler: app.handler
+      Description: Validates S3 upload (mp3, wav, m4a), mints call_id, starts Transcribe job, writes timeline event
+      Role: !GetAtt StartTranscriptionRole.Arn
+      Timeout: 30
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          VOICEMAILS_BUCKET: !Sub "shoptriage-voicemails-${AWS::AccountId}"
+          DYNAMO_TABLE: !Ref ShopTriageTable
+          TRANSCRIBE_OUTPUT_BUCKET: !Ref TranscribeOutputBucket
+      # SAM wires the S3 notification and Lambda permission here,
+      # avoiding the circular dependency that would exist if we put
+      # NotificationConfiguration inside VoicemailsBucket.
+      # One trigger per file type: an S3 notification filter takes a single
+      # suffix. Keep in step with SUPPORTED_FORMATS in start_transcription/app.py.
+      # S3 suffix matching is case-sensitive, so ".MP3" uploads won't trigger.
+      Events:
+        VoicemailUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref VoicemailsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mp3
+        VoicemailUploadedWav:
+          Type: S3
+          Properties:
+            Bucket: !Ref VoicemailsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .wav
+        VoicemailUploadedM4a:
+          Type: S3
+          Properties:
+            Bucket: !Ref VoicemailsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .m4a
+      Tags:
+        project: shoptriage
+
+  ProcessTranscriptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-process-transcript
+      CodeUri: src/lambdas/process_transcript/
+      Handler: app.handler
+      Description: Flattens transcript, classifies via Claude, writes to DynamoDB, publishes CallTriaged
+      Role: !GetAtt ProcessTranscriptRole.Arn
+      Timeout: 60   # Claude API call can take ~10s; give room
+      MemorySize: 512
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ShopTriageTable
+          ANTHROPIC_KEY_PARAM: /shoptriage/anthropic-api-key
+          CLAUDE_MODEL: claude-sonnet-5
+          TRANSCRIBE_OUTPUT_BUCKET: !Ref TranscribeOutputBucket
+          EVENT_BUS_NAME: shop-triage-bus   # created Day 3; harmless if absent
+      Tags:
+        project: shoptriage
+
+  # ── EventBridge rule: Transcribe COMPLETED → process_transcript ───────────
+  # The default event bus receives Transcribe job state change events natively
+  # (no extra setup required). We pattern-match on source=aws.transcribe,
+  # detail-type=Transcribe Job State Change, detail.TranscriptionJobStatus=COMPLETED,
+  # AND we filter on a job name prefix so this rule only fires for ShopTriage jobs.
+  TranscribeCompletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shoptriage-transcribe-completed
+      Description: Fires when a shoptriage-* Transcribe job completes
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.transcribe
+        detail-type:
+          - Transcribe Job State Change
+        detail:
+          TranscriptionJobStatus:
+            - COMPLETED
+          TranscriptionJobName:
+            - prefix: shoptriage-
+      State: ENABLED
+      Targets:
+        - Id: ProcessTranscriptTarget
+          Arn: !GetAtt ProcessTranscriptFunction.Arn
+
+  # Allow EventBridge to invoke process_transcript
+  TranscribeRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessTranscriptFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TranscribeCompletionRule.Arn
+
+  # ── Stub functions (Days 3-5, unchanged) ──────────────────────────────────
+
+  RoutingDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-routing-dispatcher
+      CodeUri: src/lambdas/routing_dispatcher/
+      Handler: app.handler
+      Description: Routes CallTriaged events to SNS/SQS based on category/urgency
+      Role: !GetAtt RoutingDispatcherRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          ONCALL_TOPIC_ARN: !Ref OncallAlertsTopic
+          OWNER_TOPIC_ARN: !Ref OwnerAlertsTopic
+          FRONT_OFFICE_QUEUE_URL: !Ref FrontOfficeQueue
+          VENDOR_QUEUE_URL: !Ref VendorQueue
+          DYNAMO_TABLE: !Ref ShopTriageTable
+          STATE_MACHINE_ARN: !Ref EscalationStateMachine
+          # Demo mode: seconds instead of the real 15min/2hr ack windows,
+          # so escalation is watchable live during a demo.
+          EMERGENCY_ACK_SECONDS: "60"
+          COMEBACK_ACK_SECONDS: "90"
+          NEEDS_REVIEW_ACK_SECONDS: "90"
+      Tags:
+        project: shoptriage
+
+  # Allow EventBridge custom bus to invoke routing_dispatcher
+  RoutingDispatcherInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RoutingDispatcherFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/shop-triage-bus/*"
+
+  EscalationAckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-escalation-ack
+      CodeUri: src/lambdas/escalation_ack/
+      Handler: app.handler
+      Description: GET /ack — calls Step Functions SendTaskSuccess and marks the call acknowledged
+      Role: !GetAtt EscalationAckRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ShopTriageTable
+      Events:
+        AckRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /ack
+            Method: get
+      Tags:
+        project: shoptriage
+
+  InboxWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-inbox-writer
+      CodeUri: src/lambdas/inbox_writer/
+      Handler: app.handler
+      Description: Writes one staff inbox row (INBOX#<role>) per escalation alert
+      Role: !GetAtt InboxWriterRole.Arn
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ShopTriageTable
+      Tags:
+        project: shoptriage
+
+  SendAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-send-alert
+      CodeUri: src/lambdas/send_alert/
+      Handler: app.handler
+      Description: Sends the SES alert email with the Acknowledge link; called with a Step Functions task token
+      Role: !GetAtt SendAlertRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ShopTriageTable
+          ALERT_FROM_EMAIL: !Ref AlertEmail
+          ONCALL_EMAIL: !Ref AlertEmail
+          OWNER_EMAIL: !Ref AlertEmail
+          ACK_BASE_URL: !Sub "https://${ShopTriageApi}.execute-api.${AWS::Region}.amazonaws.com"
+      Tags:
+        project: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STEP FUNCTIONS ESCALATION WORKFLOW (Day 4)
+  # ════════════════════════════════════════════════════════════════════════════
+  # Standard workflow (not Express) — we need it to run for minutes/hours in
+  # real mode and to keep a durable execution history for the demo console.
+  # waitForTaskToken pauses the workflow at each Notify* state until either
+  # GET /ack calls SendTaskSuccess, or TimeoutSecondsPath elapses and the
+  # Catch block routes to the next stage (re-alert, then overdue).
+  EscalationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: shoptriage-escalation
+      Type: STANDARD
+      DefinitionUri: src/statemachine/escalation.asl.json
+      DefinitionSubstitutions:
+        InboxWriterArn: !GetAtt InboxWriterFunction.Arn
+        SendAlertArn: !GetAtt SendAlertFunction.Arn
+        DynamoTableName: !Ref ShopTriageTable
+      Role: !GetAtt EscalationStateMachineRole.Arn
+      Tags:
+        project: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # API GATEWAY HTTP API (Day 4 added /ack; Day 5 adds the rest)
+  # ════════════════════════════════════════════════════════════════════════════
+  # CORS is locked to the CloudFront frontend origin only — this is a browser
+  # API for our own React app, not a public API for third parties.
+  # Throttling (2 req/sec, burst 5) is deliberately low: this is a hackathon
+  # demo, not a production API, and the real cost risk (Transcribe + Claude)
+  # is on /demo/calls specifically, which also has its own daily cap below.
+  ShopTriageApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "https://d22i5q9f7x15b9.cloudfront.net"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+      Tags:
+        project: shoptriage
+
+  DemoTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-demo-trigger
+      CodeUri: src/lambdas/demo_trigger/
+      Handler: app.handler
+      Description: Copies preset sample voicemail into intake bucket on POST /demo/calls
+      Role: !GetAtt DemoTriggerRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          SAMPLES_BUCKET: !Sub "shoptriage-samples-${AWS::AccountId}"
+          VOICEMAILS_BUCKET: !Sub "shoptriage-voicemails-${AWS::AccountId}"
+          DYNAMO_TABLE: !Ref ShopTriageTable
+          DEMO_DAILY_CAP: "50"
+      Events:
+        DemoCallsRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /demo/calls
+            Method: post
+      Tags:
+        project: shoptriage
+
+  ApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shoptriage-api-handler
+      CodeUri: src/lambdas/api_handler/
+      Handler: app.handler
+      Description: Serves the callback board, timeline, inbox, status-update, notes, attempts, and dashboard stats routes
+      Role: !GetAtt ApiHandlerRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ShopTriageTable
+      Events:
+        ListCallsRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /calls
+            Method: get
+        TimelineRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /calls/{id}/timeline
+            Method: get
+        InboxRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /inbox/{role}
+            Method: get
+        UpdateStatusRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /calls/{id}/status
+            Method: post
+        StatsRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /stats
+            Method: get
+        AddNoteRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /calls/{id}/notes
+            Method: post
+        LogAttemptRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ShopTriageApi
+            Path: /calls/{id}/attempts
+            Method: post
+      Tags:
+        project: shoptriage
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM ROLES — least-privilege, one per function
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── start_transcription ───────────────────────────────────────────────────
+  # Needs: read from VoicemailsBucket, start a Transcribe job, write to DynamoDB
+  StartTranscriptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-start-transcription-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartTranscriptionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadVoicemails
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: !Sub "arn:aws:s3:::shoptriage-voicemails-${AWS::AccountId}/*"
+              - Sid: StartTranscribeJob
+                Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:TagResource   # required when Tags are passed to StartTranscriptionJob
+                Resource: "*"   # Transcribe doesn't support resource-level perms on these actions
+              - Sid: AllowTranscribeOutputWrite
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${TranscribeOutputBucket.Arn}/*"
+              - Sid: WriteTimeline
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── process_transcript ────────────────────────────────────────────────────
+  # Needs: read Transcribe output from S3, read SSM key, write DynamoDB,
+  #        publish to the custom EventBridge bus (created Day 3 — permission
+  #        is safe to include now; it just won't be used until the bus exists)
+  ProcessTranscriptRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-process-transcript-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessTranscriptPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadTranscriptOutput
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${TranscribeOutputBucket.Arn}/*"
+              - Sid: GetAnthropicKey
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/shoptriage/anthropic-api-key"
+              - Sid: WriteDynamo
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt ShopTriageTable.Arn
+              - Sid: PublishToCustomBus
+                Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/shop-triage-bus"
+              - Sid: GetTranscribeJob
+                Effect: Allow
+                Action:
+                  - transcribe:GetTranscriptionJob
+                Resource: "*"
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── routing_dispatcher ────────────────────────────────────────────────────
+  # Needs: publish to both SNS topics, send to both SQS queues,
+  #        update DynamoDB call status, write timeline events.
+  RoutingDispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-routing-dispatcher-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RoutingDispatcherPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PublishSNS
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref OncallAlertsTopic
+                  - !Ref OwnerAlertsTopic
+              - Sid: SendSQS
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt FrontOfficeQueue.Arn
+                  - !GetAtt VendorQueue.Arn
+              - Sid: UpdateDynamo
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt ShopTriageTable.Arn
+              - Sid: StartEscalation
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EscalationStateMachine
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── escalation_ack ────────────────────────────────────────────────────────
+  # Needs: resume the paused Step Functions task (SendTaskSuccess/Failure —
+  # these actions don't support resource-level ARNs, only "*"), and update
+  # the call's status directly in DynamoDB.
+  EscalationAckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-escalation-ack-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EscalationAckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ResumeWorkflow
+                Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: "*"
+              - Sid: UpdateCallStatus
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── inbox_writer ──────────────────────────────────────────────────────────
+  # Needs: write one INBOX#<role> row per alert. Invoked directly by the
+  # escalation state machine, not by SQS.
+  InboxWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-inbox-writer-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InboxWriterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteInbox
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── send_alert ────────────────────────────────────────────────────────────
+  # Needs: send SES email, write the STAGE_NOTIFIED/STAGE_ESCALATED timeline
+  # event. SES actions don't support scoping to a specific email identity by
+  # name pattern reliably across accounts, so we scope to any identity in
+  # this account/region rather than "*".
+  SendAlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-send-alert-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SendAlertPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SendEmail
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+              - Sid: WriteTimeline
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── escalation state machine's own execution role ───────────────────────
+  # Step Functions (not a Lambda) needs its own least-privilege role: invoke
+  # the two alert Lambdas, and write directly to DynamoDB for the overdue path.
+  EscalationStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-escalation-state-machine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EscalationStateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeAlertLambdas
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt InboxWriterFunction.Arn
+                  - !GetAtt SendAlertFunction.Arn
+              - Sid: OverdueDynamoWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── demo_trigger (stub) ───────────────────────────────────────────────────
+  DemoTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-demo-trigger-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DemoTriggerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSamples
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::shoptriage-samples-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::shoptriage-samples-${AWS::AccountId}/*"
+              - Sid: CopyToVoicemails
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::shoptriage-voicemails-${AWS::AccountId}/*"
+              - Sid: DailyCapCounter
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  # ── api_handler ────────────────────────────────────────────────────────────
+  # Needs: Query (GSI1 for the callback board, base table for timeline/inbox),
+  # GetItem (existence check before returning timeline/status), UpdateItem +
+  # PutItem (status change + its timeline event). No Scan permission at all —
+  # the callback board must always go through GSI1.
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shoptriage-api-handler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiHandlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadCalls
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt ShopTriageTable.Arn
+                  - !Sub "${ShopTriageTable.Arn}/index/GSI1"
+              - Sid: WriteStatusUpdates
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ShopTriageTable.Arn
+      Tags:
+        - Key: project
+          Value: shoptriage
+
+  
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  CloudFrontURL:
+    Description: Public URL of the ShopTriage frontend
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+
+  FrontendBucketName:
+    Description: S3 bucket name for frontend assets
+    Value: !Ref FrontendBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidations)
+    Value: !Ref FrontendDistribution
+
+  TranscribeOutputBucketName:
+    Description: S3 bucket where Transcribe writes output JSON
+    Value: !Ref TranscribeOutputBucket
+
+  VoicemailsBucketName:
+    Description: Drop audio files here to trigger the intake pipeline
+    Value: !Ref VoicemailsBucket
+
+  SamplesBucketName:
+    Description: Pre-generated Polly sample voicemails (managed outside CloudFormation)
+    Value: !Sub "shoptriage-samples-${AWS::AccountId}"
+
+  DynamoTableName:
+    Description: DynamoDB single table
+    Value: !Ref ShopTriageTable
+
+  AnthropicKeyParameterPath:
+    Description: SSM path — overwrite with real key after deploy
+    Value: /shoptriage/anthropic-api-key
+
+  SharedLayerArn:
+    Description: ARN of the shared Lambda layer
+    Value: !Ref SharedLayer
+
+  ShopTriageBusArn:
+    Description: Custom EventBridge bus ARN
+    Value: !GetAtt ShopTriageBus.Arn
+
+  OncallAlertsTopicArn:
+    Description: SNS topic for on-call emergency alerts
+    Value: !Ref OncallAlertsTopic
+
+  OwnerAlertsTopicArn:
+    Description: SNS topic for owner (comeback) alerts
+    Value: !Ref OwnerAlertsTopic
+
+  FrontOfficeQueueUrl:
+    Description: SQS queue URL for front-office categories
+    Value: !Ref FrontOfficeQueue
+
+  VendorQueueUrl:
+    Description: SQS queue URL for parts_vendor calls
+    Value: !Ref VendorQueue
+
+  EscalationStateMachineArn:
+    Description: Step Functions escalation workflow ARN
+    Value: !Ref EscalationStateMachine
+
+  ApiEndpoint:
+    Description: Base URL of the ShopTriage HTTP API (ack link uses this)
+    Value: !Sub "https://${ShopTriageApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+

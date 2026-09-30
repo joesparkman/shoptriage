@@ -1,0 +1,32 @@
+# samconfig.toml.example
+# Copy to samconfig.toml (which is gitignored) and fill in your own values, then run
+# "sam deploy" from the repo root.
+
+version = 0.1
+
+[default]
+[default.global.parameters]
+stack_name = "shoptriage"
+region     = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+disable_rollback = false
+tags = "project=shoptriage"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+# Your AWS CLI profile and the address that sends/receives alert emails.
+profile = "your-aws-profile"
+parameter_overrides = "AlertEmail=you@example.com"
+stack_name        = "shoptriage"
+s3_prefix         = "shoptriage"
+region            = "us-east-1"
+confirm_changeset = false
+capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+disable_rollback  = false
+tags              = "project=shoptriage"
+# resolve_s3 = true tells SAM to auto-create the deployment artifacts bucket
+resolve_s3        = true

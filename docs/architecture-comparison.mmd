@@ -1,0 +1,50 @@
+graph TD
+    subgraph v1["v1: Property Management Call Triage (headless)"]
+        v1S3["S3: voicemail upload"] --> v1ST["start_transcription"]
+        v1ST --> v1TR["Amazon Transcribe"]
+        v1TR --> v1EB["EventBridge default bus"]
+        v1EB --> v1PT["process_transcript"]
+        v1PT --> v1Claude["Claude: classify"]
+        v1Claude --> v1DDB[("DynamoDB\n(Scan-based reads)")]
+        v1DDB --> v1SES["SES: one email\nto a fixed staff list"]
+        v1DDB --> v1Weekly["Weekly summary email"]
+    end
+
+    subgraph v2["v2: ShopTriage (this project)"]
+        v2S3["S3: voicemail upload"] --> v2ST["start_transcription"]
+        v2ST --> v2TR["Amazon Transcribe"]
+        v2TR --> v2EB["EventBridge default bus"]
+        v2EB --> v2PT["process_transcript"]
+        v2PT --> v2Claude["Claude: classify only
+(never decides routing)"]
+        v2Claude --> v2DDB[("DynamoDB single table
++ GSI1, no Scans")]
+        v2DDB --> v2Bus{{"shop-triage-bus
+custom EventBridge bus + archive"}}
+        v2Bus --> v2Rules["Routing rules
+by category / urgency"]
+        v2Rules --> v2Disp["routing_dispatcher
+marks routed, starts escalation"]
+        v2Rules --> v2SNS["SNS: oncall / owner
+alert topics"]
+        v2Rules --> v2SQS["SQS + DLQ
+(front office / vendor queues)"]
+        v2Rules --> v2Spam["CloudWatch Logs:
+spam calls, log only"]
+        v2Disp --> v2SFN["Step Functions
+escalation + acknowledgment"]
+        v2SFN --> v2Send["send_alert"]
+        v2Send --> v2SES["SES: alert email
+with Acknowledge link"]
+        v2SQS --> v2Alarm["CloudWatch alarm:
+DLQ depth"]
+        v2React["React web app
+(demo console / callback board / staff inbox)"] --> v2API["API Gateway HTTP API
+(incl. GET /ack)"]
+        v2API --> v2Handler["api_handler"]
+        v2Handler --> v2DDBRead[("DynamoDB
+Query on GSI1")]
+    end
+
+    class v2Bus,v2Rules,v2Disp,v2SNS,v2SQS,v2Spam,v2SFN,v2Send,v2SES,v2Alarm,v2DDB,v2DDBRead,v2API,v2Handler,v2React new
+    classDef new fill:#1f2d3d,stroke:#58a6ff,stroke-width:2px,color:#58a6ff;
