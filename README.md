@@ -49,7 +49,7 @@ table scans anywhere), exposed to a React frontend via an API Gateway HTTP API.
 | SES | Staff email alerts (SMS was ruled out — US 10DLC/toll-free registration wouldn't clear in time for the hackathon deadline). |
 | API Gateway (HTTP API) | Cheaper and simpler than REST API for this use case; CORS locked to the CloudFront origin, throttled (rate 2, burst 5). |
 | SSM Parameter Store (SecureString) | Anthropic API key, fetched once on cold start and cached — cheaper than Secrets Manager for a single key. |
-| AWS Budgets | $20/month cost guardrail with email alerts at 80% actual and 100% forecasted spend. |
+| AWS Budgets | $20/month cost guardrail with email alerts at 85% and 100% of actual spend and at 100% forecasted spend. |
 
 ## v1 vs. v2 architecture comparison
 

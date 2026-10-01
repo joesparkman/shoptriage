@@ -2332,3 +2332,33 @@ old wording absent; the pasteable HTML renders with all 31 icons and no sideways
 chart (the new `-.->` dotted edge with a label is standard syntax but was not rendered here).
 **Deployed:** frontend rebuilt, synced to S3 with `--delete`, and CloudFront invalidated. Verified over HTTP: the live JavaScript bundle contains the new v1 text and no longer contains the old "fixed staff list" wording.
 
+## Documentation corrections, and the repo moved to a clean history
+
+**Repo:** The first public repo showed Claude as a contributor because two commits carried a
+co-author trailer. The history was rewritten by the repo owner, the old repo deleted, and the project
+pushed to a new repo, `shoptriage`. Checked from the outside afterwards: 2 commits, one author and
+contributor, no co-author lines, one branch, no tags, 71 files, no local-only files, and a pattern
+scan over every commit (account id, personal emails, API id, key formats, private keys, any 12-digit
+number) found nothing. From here on all commits and pushes are made by the owner, not the agent.
+
+**Fixes to `docs/v1-vs-v2-writeup.md`** (found by checking each claim against the code and this log):
+- The circular CloudFormation dependency was between the S3 bucket and the Lambda it triggers
+  (see the "Problems hit and fixed" entry), not between EventBridge and S3.
+- First alert timing: "about 30 seconds" became "within 30 seconds (5 to 24 seconds across my
+  emergency test calls)", which matches the measured upload-to-first-alert times.
+- The 15-minute escalation window is the documented plan for a real shop and was never run, so it
+  is now described as a plan and a single setting.
+- DLQ wording: the queue setting is `maxReceiveCount = 3`, meaning a message moves to the DLQ after
+  3 failed deliveries, not "3 retries".
+- Escalation wording now matches the state machine: after the first timeout it sends a re-alert to
+  the owner, and after a second timeout it marks the call overdue.
+- Backstory wording made consistent with the README: the shop "no longer had" the person who
+  screened calls (the earlier text said they were let go; the README said they left).
+
+**Fix to `README.md`:** the AWS Budgets row said alerts fire at 80% actual and 100% forecasted. The
+live budget ($20 monthly) notifies at 85% and 100% of actual spend and at 100% forecasted spend.
+Checked directly against the account's budget settings.
+
+**Open item the write-up should be ready for:** the front-office and vendor SQS queues have dead-letter
+queues and an alarm, but no function reads from them yet.
+

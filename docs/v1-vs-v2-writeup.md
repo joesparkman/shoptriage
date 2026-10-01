@@ -1,6 +1,6 @@
 ## The problem
 
-After a repair at a local independent shop, my car still had issues, and I couldn't reach anyone for about two weeks. The shop services roughly 200 cars a month and had let go of the one person who screened every call, leaving the owner and his wife answering phones while running the shop. Voicemails piled up, and customers waited weeks for callbacks that should have taken a day.
+After a repair at a local independent shop, my car still had issues, and I couldn't reach anyone for about two weeks. The shop services roughly 200 cars a month and no longer had the one person who screened every call, leaving the owner and his wife answering phones while running the shop. Voicemails piled up, and customers waited weeks for callbacks that should have taken a day.
 
 ## What ShopTriage does
 
@@ -9,7 +9,7 @@ ShopTriage makes sure every voicemail is heard, classified, sent to the right pe
 * **Listen:** Each voicemail is transcribed with Amazon Transcribe.
 * **Classify:** Claude reads the transcript and returns the category, urgency, whether it's a comeback (a car returning with the same problem), and caller details. That is its only job.
 * **Route:** EventBridge rules decide who gets notified. Emergencies go to on-call staff and the owner, front-office and vendor calls go to their own queues, and robocalls are only logged.
-* **Escalate:** Urgent and comeback calls start a Step Functions workflow that emails an acknowledgment link. If nobody clicks in time, it re-alerts, escalates to the owner, and finally marks the call overdue.
+* **Escalate:** Urgent and comeback calls start a Step Functions workflow that emails an acknowledgment link. If nobody clicks in time, it escalates to the owner with a re-alert, and if that goes unanswered too, it marks the call overdue.
 * **Track:** A React web app gives the shop a live dashboard, a callback board where staff log each attempt ("reached them" or "no answer") and add notes, and a staff inbox of alerts for each role.
 
 ## Key design choice: the AI never decides routing
@@ -41,7 +41,7 @@ ShopTriage (v2) is a new build that goes well beyond my earlier headless propert
 | Alerting | A single Lambda emails one fixed per-call recipient | EventBridge rules route by category and urgency to on-call, owner, front-office, and vendor channels (SNS/SQS) |
 | Reporting | Weekly digest email to a fixed manager address | Live dashboard + `/stats` endpoint; no weekly digest yet |
 | Acknowledgment | None | Step Functions waits for an acknowledgment click, re-alerts, then escalates to the owner |
-| Failure handling | No dead-letter queues | SQS DLQs on front-office/vendor queues (3 retries) with a CloudWatch alarm |
+| Failure handling | No dead-letter queues | SQS DLQs on front-office/vendor queues (messages move to the DLQ after 3 failed deliveries) with a CloudWatch alarm |
 | Data access | Full table scans (single-key table, no GSI) | Single-table design, GSI1 queries only, no scans |
 | Callback tracking | None | Logged attempts and notes on every call |
 
@@ -52,8 +52,8 @@ ShopTriage (v2) is a new build that goes well beyond my earlier headless propert
 ## Results from testing
 
 * About 5 seconds from audio arriving to a fully classified call
-* First alert email sent in about 30 seconds
-* Escalation timeout of 1 minute for the demo (about 15 minutes in a real shop)
+* First alert email sent within 30 seconds (5 to 24 seconds across my emergency test calls)
+* Escalation timeout of 1 minute for the demo (the plan for a real shop is 15 minutes; it is a single setting)
 
 ## How the coding agent was used
 
@@ -62,7 +62,7 @@ I built ShopTriage day by day with an AI coding agent doing the implementation: 
 Real bugs we worked through:
 
 * A Lambda layer path mismatch
-* A circular CloudFormation dependency between EventBridge and S3
+* A circular CloudFormation dependency between the S3 bucket and the Lambda function it triggers
 * Claude wrapping its JSON responses in markdown fences
 * A DynamoDB reserved-keyword collision on `ttl`
 
