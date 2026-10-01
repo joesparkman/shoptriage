@@ -113,6 +113,7 @@ export default function Dashboard() {
     );
   }
 
+  const days = stats.retention_days ?? 60;
   const dial = closeDial(stats.avg_close_minutes);
   const lights = stats.lights;
   const routeMax = Math.max(...stats.routes.map((r) => r.count), 1);
@@ -143,8 +144,8 @@ export default function Dashboard() {
           </div>
 
           <div className="dash-odo-box">
-            <div className="dash-odo-title">Calls triaged · last 7 days</div>
-            <Odometer value={stats.calls_7d} />
+            <div className="dash-odo-title">Calls triaged · last {days} days</div>
+            <Odometer value={stats.calls_total} />
           </div>
 
           <div className="dash-lcd">
@@ -177,7 +178,7 @@ export default function Dashboard() {
 
       <div className="dash-minis">
         <div className="dash-mini">
-          <h3>Urgency mix · 7 days</h3>
+          <h3>Urgency mix · {days} days</h3>
           <SegmentedBar
             segments={URGENCY_ORDER.map((u) => ({
               key: u,
@@ -198,7 +199,7 @@ export default function Dashboard() {
               color: STATUS_COLORS[s],
             }))}
           />
-          <p>Every call from the last 7 days, by its current status.</p>
+          <p>Every call from the last {days} days, by its current status.</p>
         </div>
       </div>
 
@@ -229,7 +230,7 @@ export default function Dashboard() {
         </div>
 
         <div className="dash-card">
-          <h2>Routed to · 7 days</h2>
+          <h2>Routed to · {days} days</h2>
           {stats.routes.length === 0 ? (
             <p className="dash-empty">Nothing routed yet.</p>
           ) : (

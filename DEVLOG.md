@@ -2362,3 +2362,57 @@ Checked directly against the account's budget settings.
 **Open item the write-up should be ready for:** the front-office and vendor SQS queues have dead-letter
 queues and an alarm, but no function reads from them yet.
 
+## Judging-week hardening: longer retention, higher limits, stats cache
+
+**Why:** The contest rules make "live and reachable by judges and the AI scoring system" a pass/fail
+gate, and evaluation runs from Oct 5 to mid-October. Three things could have shown judges an empty or
+failing app: demo data expired after 7 days (the earliest existing record was due to expire on
+Oct 3), the whole API shared a limit of 2 requests per second (burst 5), and the demo endpoint was
+capped at 50 calls per day.
+
+**Changed (AWS resources and code):**
+- **Retention is now one setting.** `RETENTION_DAYS: "60"` in the template's global function
+  environment, read by every function that writes an item (`dynamo.py`, `timeline.py`,
+  `process_transcript`, `inbox_writer`) instead of four separate hard-coded 7s. Existing records
+  (written with the old 7-day expiry) were extended once by a maintenance script: 127 items moved to
+  an expiry 60 days out, never earlier; the two per-day demo counters and six workflow-written
+  events that have no expiry were left alone. A re-run found nothing left to extend. The EventBridge
+  archive is a separate resource and still keeps 7 days.
+- **API limits:** default route throttle raised from 2/s (burst 5) to 20/s (burst 40). The
+  `POST /demo/calls` route, which starts the whole pipeline, has its own tighter limit of 5/s
+  (burst 10). `DEMO_DAILY_CAP` raised from 50 to 300 per day.
+- **`GET /stats` response cache:** within one warm Lambda container the last answer is reused for 5
+  seconds, so a crowd of dashboard viewers does not repeat seven queries each. Numbers may be up to 5
+  seconds stale. Also, the field `calls_7d` was renamed `calls_total` (it counts everything stored,
+  not 7 days) and the response now includes `retention_days`, so the dashboard labels ("last 60
+  days") can never drift from the setting.
+- Frontend dashboard labels and README text updated to match (60-day retention, new throttle).
+
+**Finding that limits how far the throttle can safely go:** the AWS account's Lambda concurrency
+limit is **10 for the whole account** (new-account default), shared by every function. Raising the
+API throttle does not raise that ceiling, so the throttle was set to 20/s instead of something far
+larger. A reserved-concurrency carve-out is not possible at a limit of 10. The real fix is a Service
+Quotas increase request for Lambda concurrent executions (a console step; not requested).
+
+**Verified:**
+- Local tests: retention default (60) and override for the layer modules; no hard-coded 7 left in the
+  Lambdas; stats cache serves a second call 2 s later with zero new queries and refreshes after 5 s;
+  the earlier stats and notes suites still pass.
+- `sam validate --lint`; a changeset preview before deploying showed no resource replacements.
+- After deploy: stack `UPDATE_COMPLETE`; live API stage shows 20/40 default and 5/10 on the demo
+  route; `DEMO_DAILY_CAP=300`; `RETENTION_DAYS=60` on four checked functions; `/stats` returns
+  `calls_total` and `retention_days` and no longer returns `calls_7d`.
+- Burst test: 40 simultaneous requests returned 40 x HTTP 200 (under the old limit most would have
+  been 429). Client-side wall time was ~22 s per burst, but CloudWatch for the same window showed
+  Lambda duration averaging 53 to 290 ms, API Gateway latency 65 to 543 ms (max 3.1 s on cold
+  starts), zero throttles, zero errors, zero 4xx/5xx, and peak concurrency 8 of 10. So the slowness
+  was on the test machine's side, not AWS; but it does show 40 simultaneous users would use most of
+  the account's concurrency.
+- One real demo voicemail (`repair_status`) was triggered live: it reached classified and routed, its
+  call record and timeline events both expire 60.0 days out. That call is still in the table.
+
+**Not measured / not done:** cost per demo call (the Anthropic API usage is billed separately from
+AWS and was not checked); SES is in sandbox mode, whose daily send quota (about 200 emails) could
+limit alert emails if many emergency demos are triggered, though the app itself would keep working;
+no Service Quotas request was made.
+

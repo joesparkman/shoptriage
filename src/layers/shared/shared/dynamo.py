@@ -8,7 +8,7 @@ Table key design (recap):
   PK = CALL#<call_id>   SK = EVENT#<iso_ts>#<stage>  → timeline entry
   PK = INBOX#<role>     SK = <iso_ts>#<call_id>      → staff inbox row
 
-TTL is always set to 7 days from now. DynamoDB will garbage-collect
+TTL is always set RETENTION_DAYS (default 60) days from now. DynamoDB will garbage-collect
 demo data automatically with no Lambda needed.
 """
 
@@ -24,7 +24,7 @@ from boto3.dynamodb.conditions import Key
 logger = logging.getLogger(__name__)
 
 _TABLE_NAME = os.environ.get("DYNAMO_TABLE", "shoptriage")
-_TTL_DAYS = 7
+_TTL_DAYS = int(os.environ.get("RETENTION_DAYS", "60"))   # one setting: RETENTION_DAYS in template.yaml
 _resource = None
 
 
@@ -36,7 +36,7 @@ def _table():
 
 
 def _ttl() -> int:
-    """Unix timestamp 7 days from now."""
+    """Unix timestamp RETENTION_DAYS days from now."""
     return int(time.time()) + _TTL_DAYS * 86400
 
 

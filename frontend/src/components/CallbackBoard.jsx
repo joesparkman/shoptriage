@@ -58,8 +58,8 @@ export default function CallbackBoard() {
   const [open, setOpen] = useState({ id: null, kind: null });
   const pollRef = useRef(null);
 
-  // One request returns every open call (the API throttles at 2 requests/second,
-  // so a request per status would trip it). A failed poll after data is already
+  // One request returns every open call (one request per status was 5x the traffic
+  // and tripped the API's old 2 requests/second limit). A failed poll after data is already
   // showing is just "stale": the next poll usually recovers, so don't flash an error.
   async function load() {
     try {

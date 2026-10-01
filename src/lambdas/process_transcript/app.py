@@ -62,8 +62,8 @@ TRANSCRIBE_OUTPUT_BUCKET = os.environ.get("TRANSCRIBE_OUTPUT_BUCKET", "")
 EVENT_BUS_NAME = os.environ.get("EVENT_BUS_NAME", "shop-triage-bus")
 DYNAMO_TABLE = os.environ.get("DYNAMO_TABLE", "shoptriage")
 
-# TTL for demo data: 7 days
-TTL_DAYS = 7
+# TTL for demo data: one setting, RETENTION_DAYS in template.yaml (default 60)
+TTL_DAYS = int(os.environ.get("RETENTION_DAYS", "60"))
 
 
 def handler(event: dict, context) -> dict:

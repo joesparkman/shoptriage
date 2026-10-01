@@ -18,6 +18,9 @@ Globals:
       Variables:
         POWERTOOLS_SERVICE_NAME: shoptriage
         LOG_LEVEL: INFO
+        # How long call records, timeline events and inbox rows are kept before DynamoDB TTL
+        # removes them. One setting, read by every function that writes an item.
+        RETENTION_DAYS: "60"
     Tags:
       project: shoptriage
 
@@ -273,7 +276,7 @@ Resources:
   # Purpose: replay events during development and demo without re-triggering
   # the intake pipeline. EventBridge replay re-delivers archived events to the
   # bus exactly as they were, so all routing rules fire again from the same payload.
-  # 7-day retention matches the DynamoDB TTL on call records.
+  # (The archive keeps 7 days; DynamoDB call records are kept longer, see RETENTION_DAYS.)
   ShopTriageBusArchive:
     Type: AWS::Events::Archive
     Properties:
@@ -1004,9 +1007,18 @@ Resources:
           - OPTIONS
         AllowHeaders:
           - Content-Type
+      # Sized for judging week: a crowd of reviewers each polling the dashboard and board.
+      # (The account's Lambda concurrency limit is only 10, so the limit worth guarding is
+      # concurrent function runs; polling requests are short, so 20 rps is comfortably safe.)
       DefaultRouteSettings:
-        ThrottlingRateLimit: 2
-        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 20
+        ThrottlingBurstLimit: 40
+      # The demo-voicemail route starts the whole pipeline (Transcribe, Claude, emails), so it
+      # stays much tighter than the read routes.
+      RouteSettings:
+        "POST /demo/calls":
+          ThrottlingRateLimit: 5
+          ThrottlingBurstLimit: 10
       Tags:
         project: shoptriage
 
@@ -1025,7 +1037,7 @@ Resources:
           SAMPLES_BUCKET: !Sub "shoptriage-samples-${AWS::AccountId}"
           VOICEMAILS_BUCKET: !Sub "shoptriage-voicemails-${AWS::AccountId}"
           DYNAMO_TABLE: !Ref ShopTriageTable
-          DEMO_DAILY_CAP: "50"
+          DEMO_DAILY_CAP: "300"
       Events:
         DemoCallsRoute:
           Type: HttpApi

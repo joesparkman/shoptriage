@@ -20,6 +20,7 @@ IAM permissions from each other.
 import json
 import logging
 import os
+import time
 from decimal import Decimal
 
 from shared.dynamo import (
@@ -109,11 +110,29 @@ def _list_calls(query_params: dict) -> dict:
     return _json(200, {"calls": query_by_status(status)})
 
 
+# The dashboard polls /stats from every open browser tab. Each uncached call runs one
+# query per status, so a crowd of viewers would multiply that work (and the account has a
+# low Lambda concurrency limit). Within one warm Lambda container, reuse the last answer for a
+# few seconds; the numbers are analytics, so being a few seconds stale is fine.
+STATS_CACHE_SECONDS = 5
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "60"))
+_stats_cache = {"at": None, "stats": None}
+
+
 def _get_stats() -> dict:
+    now = time.monotonic()
+    cached_at = _stats_cache["at"]
+    if cached_at is not None and now - cached_at < STATS_CACHE_SECONDS:
+        return _json(200, _stats_cache["stats"])
+
     calls = []
     for status in sorted(OPEN_STATUSES | CLOSED_STATUSES):
         calls.extend(query_all_by_status(status))
-    return _json(200, compute_stats(calls))
+    stats = compute_stats(calls)
+    stats["retention_days"] = RETENTION_DAYS   # so the dashboard labels never drift from the setting
+    _stats_cache["at"] = now
+    _stats_cache["stats"] = stats
+    return _json(200, stats)
 
 
 def _get_timeline(call_id) -> dict:

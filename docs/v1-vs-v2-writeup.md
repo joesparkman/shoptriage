@@ -40,7 +40,7 @@ ShopTriage (v2) is a new build that goes well beyond my earlier headless propert
 | Interface | Headless | Dashboard, callback board, staff inbox |
 | Alerting | A single Lambda emails one fixed per-call recipient | EventBridge rules route by category and urgency to on-call, owner, front-office, and vendor channels (SNS/SQS) |
 | Reporting | Weekly digest email to a fixed manager address | Live dashboard + `/stats` endpoint; no weekly digest yet |
-| Acknowledgment | None | Step Functions waits for an acknowledgment click, re-alerts, then escalates to the owner |
+| Acknowledgment | None | Step Functions waits for an acknowledgment click, then escalates to the owner with a re-alert |
 | Failure handling | No dead-letter queues | SQS DLQs on front-office/vendor queues (messages move to the DLQ after 3 failed deliveries) with a CloudWatch alarm |
 | Data access | Full table scans (single-key table, no GSI) | Single-table design, GSI1 queries only, no scans |
 | Callback tracking | None | Logged attempts and notes on every call |

@@ -45,9 +45,9 @@ table scans anywhere), exposed to a React frontend via an API Gateway HTTP API.
 | SNS | Fan-out for per-role email-worthy alerts (oncall, owner). |
 | SQS + DLQ | Durable queues for calls that don't need immediate escalation (front office, vendor), with dead-letter queues + CloudWatch alarms so a stuck consumer is visible within a minute. |
 | Step Functions (Standard) | `waitForTaskToken` human-in-the-loop escalation with a durable, inspectable execution history — a Lambda polling loop can't do this safely. |
-| DynamoDB (single table + GSI1) | Call records, timeline events, and staff inbox rows in one table; the GSI supports the callback board with `Query`, never `Scan`. TTL auto-expires demo data after 7 days. |
+| DynamoDB (single table + GSI1) | Call records, timeline events, and staff inbox rows in one table; the GSI supports the callback board with `Query`, never `Scan`. TTL auto-expires demo data after 60 days (the single `RETENTION_DAYS` setting). |
 | SES | Staff email alerts (SMS was ruled out — US 10DLC/toll-free registration wouldn't clear in time for the hackathon deadline). |
-| API Gateway (HTTP API) | Cheaper and simpler than REST API for this use case; CORS locked to the CloudFront origin, throttled (rate 2, burst 5). |
+| API Gateway (HTTP API) | Cheaper and simpler than REST API for this use case; CORS locked to the CloudFront origin, throttled (rate 20, burst 40; the demo-voicemail route is limited to rate 5, burst 10). |
 | SSM Parameter Store (SecureString) | Anthropic API key, fetched once on cold start and cached — cheaper than Secrets Manager for a single key. |
 | AWS Budgets | $20/month cost guardrail with email alerts at 85% and 100% of actual spend and at 100% forecasted spend. |
 
@@ -200,11 +200,11 @@ distribution ID, and API endpoint needed above.
   rather than filtering by the `project=shoptriage` tag, since tag-based cost filtering requires
   activating cost allocation tags in the Billing console first (a manual one-time step). This
   account is dedicated to this hackathon project, so account-wide is equivalent in practice.
-- **DynamoDB TTL is set per-item, not per-call.** Each timeline event's TTL is computed 7 days
+- **DynamoDB TTL is set per-item, not per-call.** Each timeline event's TTL is computed 60 days
   from the moment *that event* is written, not from when the call itself was created. For a call
   that escalates, the final `overdue` event's TTL can land up to ~30 minutes (emergency) to ~4
   hours (comeback) after the call's own `META` record's TTL, using the real (non-demo) ack
-  windows. That means roughly 7 days after a call finishes, there's a window where the call's
+  windows. That means roughly 60 days after a call finishes, there's a window where the call's
   record has expired but a couple of its late-stage timeline events technically haven't yet — in
   practice invisible (`GET /calls/{id}/timeline` just 404s, same as any unknown call), but worth
   knowing about. A real fix means computing one expiry per call at creation and threading it

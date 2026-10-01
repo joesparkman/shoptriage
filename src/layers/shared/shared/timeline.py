@@ -23,7 +23,7 @@ import boto3
 logger = logging.getLogger(__name__)
 
 _TABLE_NAME = os.environ.get("DYNAMO_TABLE", "shoptriage")
-_TTL_DAYS = 7
+_TTL_DAYS = int(os.environ.get("RETENTION_DAYS", "60"))   # one setting: RETENTION_DAYS in template.yaml
 _resource = None
 
 

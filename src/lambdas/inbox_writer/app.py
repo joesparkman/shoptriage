@@ -20,7 +20,7 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _TABLE_NAME = os.environ.get("DYNAMO_TABLE", "shoptriage")
-_TTL_DAYS = 7
+_TTL_DAYS = int(os.environ.get("RETENTION_DAYS", "60"))   # one setting: RETENTION_DAYS in template.yaml
 _dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
 

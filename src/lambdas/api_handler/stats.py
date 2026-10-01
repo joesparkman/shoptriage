@@ -9,7 +9,7 @@ Every number is derived from real call records. Nothing is estimated:
   - "open" means the same statuses the callback board treats as open
   - avg_close_minutes is received_at → updated_at for calls now marked
     called_back or resolved (updated_at is when that status was set)
-  - the window is whatever the table still holds (7-day TTL)
+  - the window is whatever the table still holds (the RETENTION_DAYS setting)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -85,7 +85,7 @@ def compute_stats(calls: list[dict], now: datetime | None = None) -> dict:
 
     return {
         "generated_at": now.isoformat(),
-        "calls_7d": len(calls),
+        "calls_total": len(calls),
         "calls_last_24h": calls_last_24h,
         "calls_last_hour": calls_last_hour,
         "open_count": open_count,
