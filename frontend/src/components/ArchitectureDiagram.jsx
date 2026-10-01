@@ -46,8 +46,25 @@ const reactBadge = (
   </span>
 );
 
+// GoTo Connect is the phone system v1 records calls from: not an AWS service, so no icon file.
+const phoneBadge = (
+  <span className="arch-node-icon" style={{ background: "#546e7a" }}>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="white"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 4c0 9.4 6.6 16 16 16l2-4-6-2-2 2c-3-1.4-5.6-4-7-7l2-2-2-6z" />
+    </svg>
+  </span>
+);
+
 function Badge({ icon }) {
   if (icon === "react") return reactBadge;
+  if (icon === "phone") return phoneBadge;
   const file = FILE_ICONS[icon];
   if (!file) return null;
   const classes = ["arch-node-icon"];
@@ -181,28 +198,37 @@ export default function ArchitectureDiagram() {
       <div className="arch-column">
         <h3 className="arch-title">v1: Property Management Call Triage (headless)</h3>
         <div className="arch-flow">
-          <Node icon="s3">S3: voicemail upload</Node>
+          <Node icon="phone">GoTo Connect: tenant call recorded and dropped as an audio file</Node>
+          <Arrow />
+          <Node icon="s3">S3: recordings/ (existing bucket, left untouched)</Node>
           <Arrow />
           <Node icon="lambda">start_transcription</Node>
           <Arrow />
           <Node icon="transcribe">Amazon Transcribe</Node>
           <Arrow />
-          <Node icon="eventbridge">EventBridge default bus</Node>
+          <Node icon="eventbridge">EventBridge: Transcribe job state change</Node>
           <Arrow />
-          <Node icon="lambda">process_transcript</Node>
+          <Node icon="lambda">process_transcript (also saves a plain-text copy to an archive bucket)</Node>
           <Arrow />
-          <Node icon="claude">Claude: classify</Node>
-          <Arrow />
-          <Node icon="dynamodb">DynamoDB (Scan-based reads)</Node>
+          <Node icon="claude">Claude: category, urgency flags, summary, action items</Node>
           <Arrow />
           <Branch>
             <BranchColumn>
-              <Node icon="ses">SES: one email to a fixed staff list</Node>
+              <Node icon="dynamodb">DynamoDB: CallLog (one item per call, Scan-based reads)</Node>
             </BranchColumn>
             <BranchColumn>
-              <Node icon="ses">Weekly summary email</Node>
+              <Node icon="ses">SES: per-call triage email to the property manager</Node>
             </BranchColumn>
           </Branch>
+
+          <div className="arch-subtitle">Weekly digest</div>
+          <Node icon="eventbridge">EventBridge: weekly schedule (Monday 08:00)</Node>
+          <Arrow />
+          <Node icon="lambda">
+            weekly_summary (scans the past 7 days of CallLog; Claude writes the highlights)
+          </Node>
+          <Arrow />
+          <Node icon="ses">SES: weekly digest email</Node>
         </div>
       </div>
       </div>

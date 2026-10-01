@@ -54,21 +54,24 @@ table scans anywhere), exposed to a React frontend via an API Gateway HTTP API.
 ## v1 vs. v2 architecture comparison
 
 v1 was an earlier, headless property-management call-triage project the same builder shipped:
-intake and Claude classification only, one email to a fixed staff list, no routing, no
+intake and Claude classification only, one per-call email to a single recipient plus a weekly digest, no routing, no
 acknowledgment, no dead-letter queues, and DynamoDB reads via full table scans. Everything
 highlighted in blue below is new in ShopTriage (v2).
 
 ```mermaid
 graph TD
     subgraph v1["v1: Property Management Call Triage (headless)"]
-        v1S3["S3: voicemail upload"] --> v1ST["start_transcription"]
+        v1Goto["GoTo Connect\ncall recordings"] --> v1S3["S3: recordings/\n(existing bucket)"]
+        v1S3 --> v1ST["start_transcription"]
         v1ST --> v1TR["Amazon Transcribe"]
-        v1TR --> v1EB["EventBridge default bus"]
+        v1TR --> v1EB["EventBridge\n(Transcribe job state change)"]
         v1EB --> v1PT["process_transcript"]
         v1PT --> v1Claude["Claude: classify"]
-        v1Claude --> v1DDB[("DynamoDB\n(Scan-based reads)")]
-        v1DDB --> v1SES["SES: one email\nto a fixed staff list"]
-        v1DDB --> v1Weekly["Weekly summary email"]
+        v1Claude --> v1DDB[("DynamoDB CallLog\n(Scan-based reads)")]
+        v1PT --> v1SES["SES: per-call email\nto the property manager"]
+        v1Sched["EventBridge weekly schedule\n(Monday 08:00)"] --> v1Weekly["weekly_summary\n(Claude writes the highlights)"]
+        v1DDB -.->|scanned for the past 7 days| v1Weekly
+        v1Weekly --> v1WSES["SES: weekly digest email"]
     end
 
     subgraph v2["v2: ShopTriage (this project)"]

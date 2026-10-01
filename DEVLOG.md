@@ -2276,3 +2276,59 @@ files before committing; fixed by moving the comments to their own lines.
 **Not done:** the parameterized template has been previewed but not deployed, since there is nothing
 to change in the stack.
 
+## Paste-ready architecture diagram for the submission form
+
+**Why:** The submission has a project body section and the About-page diagram is a React component,
+so it cannot be pasted there. Generated a standalone HTML version at
+`docs/architecture-comparison.html` (v1 and v2 stacked, with the same blue "new in v2" legend).
+
+**Design choices:** every style is inline (no `<style>` block, scripts or classes, since submission
+forms often strip them); icons are `<img>` tags pointing at the live site's `/icons/` folder (served
+as `image/svg+xml`; GitHub raw URLs were avoided because GitHub serves raw SVGs in a way browsers
+will not display as images); every image has alt text so the diagram still reads if images are
+blocked. The four-way branch uses wrapping inline blocks instead of a table, so it stacks on phones.
+
+**Problem found by testing:** the first version used a four-column table, which forced the page to
+508px wide on a 420px or 360px screen (sideways scrolling). Replaced with wrapping columns and
+allowed long words to break; re-measured with no overflow at 900, 720, 420 and 360px.
+
+**Verified:** all 12 icon URLs answer 200 as SVG; rendered on a plain white host page with all 29
+images loading; no overflow at four widths; screenshots reviewed at 900px and 420px.
+
+**Caveats:** the v2 boxes come from the audited diagram (template and code). The v1 boxes come from
+the original diagram and were **not** re-verified, since v1 is a separate earlier project. The
+icons depend on the live site staying up. The file is not committed to the repo yet.
+
+## v1 architecture corrected (verified against the v1 project)
+
+**Why:** The v1 half of the comparison diagram came from the original Mermaid chart and had never
+been checked against v1 itself. After comparing with the v1 portfolio diagram and the v1 source
+(`call-triage-pipeline`: `docs/ARCHITECTURE.md`, `template.yaml`, `src/*/app.py`,
+`layer/python/call_helpers.py`), it was wrong in three ways:
+- It left out GoTo Connect (the phone system) and the fact that v1 reads from an existing,
+  untouched recordings bucket.
+- "SES: one email to a fixed staff list" was inaccurate. `process_transcript` sends one per-call
+  email to a single configured recipient (the property manager).
+- The weekly summary was drawn hanging off DynamoDB. It is a separate scheduled path: an
+  EventBridge schedule (`cron(0 8 ? * MON *)`, Monday 08:00) triggers `weekly_summary`, which scans
+  the past 7 days of CallLog, has Claude write a highlights paragraph, and emails a digest.
+
+**Confirmed true and kept:** v1 reads CallLog with a **Scan** (`call_helpers.query_calls_since`
+documents itself as "Scan-based query"), even though the portfolio diagram says "queries".
+
+**Changed (all four places that carried the old v1, kept in sync):** the paste-ready
+`docs/architecture-comparison.html`, `docs/architecture-comparison.mmd`, the Mermaid chart and
+intro sentence in `README.md`, the About-page component `ArchitectureDiagram.jsx` (new GoTo Connect
+phone badge; separate "Weekly digest" section), and the v1 line in `BUILD_PLAN.md`. Earlier DEVLOG
+entries are left as written, as history.
+
+**Not in the diagram on purpose:** v1 also has a manual `resend_summary` Lambda and three archive
+S3 prefixes; the portfolio diagram omits them too, so they are mentioned only where they fit
+(the archive copy in the `process_transcript` box).
+
+**Verified:** server-rendered the About diagram and checked every new v1 label is present and the
+old wording absent; the pasteable HTML renders with all 31 icons and no sideways overflow at 900,
+720, 420 and 360px; frontend build passes. **Not verified:** how GitHub renders the updated Mermaid
+chart (the new `-.->` dotted edge with a label is standard syntax but was not rendered here).
+**Deployed:** frontend rebuilt, synced to S3 with `--delete`, and CloudFront invalidated. Verified over HTTP: the live JavaScript bundle contains the new v1 text and no longer contains the old "fixed staff list" wording.
+

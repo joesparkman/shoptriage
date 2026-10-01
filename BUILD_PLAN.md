@@ -105,7 +105,7 @@ Generate them with **Amazon Polly** via a one-time script (`scripts/make_samples
 ## Deliverables
 - Working public URL
 - **Architecture comparison diagram (required by the hackathon organizers).** A side-by-side of my earlier property management call triage project (v1) and ShopTriage (v2). Include it in the README (Mermaid), on the app's About page, and as an image for the Builder Center submission. Show:
-  - **v1:** S3 → start_transcription → Transcribe → EventBridge → process_transcript → Claude → DynamoDB → one SES email to a fixed staff list + weekly summary. Headless, no UI, no routing, no acknowledgment, no DLQ, DynamoDB Scan.
+  - **v1:** S3 → start_transcription → Transcribe → EventBridge → process_transcript → Claude → DynamoDB, plus one per-call SES email to a single recipient and a scheduled weekly digest. Headless, no UI, no routing, no acknowledgment, no DLQ, DynamoDB Scan.
   - **v2:** same intake, then → custom EventBridge bus → routing rules by category/urgency → SNS (urgent alerts per role) and SQS with DLQs (front office, vendors) → Step Functions escalation with acknowledgment → DynamoDB with GSI → API Gateway → React web app (demo console, callback board, staff inbox).
   - Visually highlight the parts that are new in v2.
 - `README.md`: problem, architecture, AWS services used and why, how to deploy, trade-offs, future work (SMS once registered, real phone system integration, multi-shop SaaS)
